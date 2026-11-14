@@ -405,6 +405,18 @@ jobs:
           echo "=== 已启用的机型数量 (应为 1) ==="
           grep -c '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y' .config
 
+      # OpenWrt 的 target/linux/compile 不会自动把 tools/ 与 toolchain/ 装好,
+      # 直接调用会因缺 aarch64-openwrt-linux-musl-gcc 与 staging_dir/host/bin/m4 失败
+      # (run 43620002355)。全量 make 会按依赖顺序自动完成, 但 check 模式必须显式补上。
+      - name: Build host tools and cross toolchain
+        run: |
+          set -euo pipefail
+          cd src
+          echo "=== tools/install ==="
+          make -j$(nproc) V=s tools/install
+          echo "=== toolchain/install ==="
+          make -j$(nproc) V=s toolchain/install
+
       - name: Build kernel / DTB only (check mode)
         if: ${{ inputs.check_only }}
         run: |
@@ -476,9 +488,13 @@ jobs:
           SIZE=$(stat -c%s "$IMG")
           echo "镜像: $IMG ($SIZE bytes)"
           test "$SIZE" -lt 33554432 || { echo "镜像超过 32MiB (32768k) firmware 分区"; exit 1; }
-          strings "$IMG" | grep -q 'mediatek,mt7981-spim-snand-rfb' \
-            && echo '板型标识 OK' \
-            || echo '警告: 镜像内未找到板型标识, 需人工复核 metadata'
+          # 先落盘再 grep，避免 pipefail 下 grep -q 提前关闭管道导致 SIGPIPE 误报
+          strings "$IMG" > /tmp/sysupgrade.strings
+          if grep -q 'mediatek,mt7981-spim-snand-rfb' /tmp/sysupgrade.strings; then
+            echo '板型标识 OK'
+          else
+            echo '警告: 镜像内未找到板型标识, 需人工复核 metadata'
+          fi
           SHA=$(sha256sum "$IMG" | cut -d' ' -f1)
           echo "$SHA  $(basename "$IMG")" > "$OUT/SHA256SUMS-custom"
           echo "SHA256: $SHA"
