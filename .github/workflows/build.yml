@@ -473,6 +473,7 @@ jobs:
       - name: Full build
         if: ${{ !inputs.check_only }}
         run: |
+          set -o pipefail
           cd src
           make -j$(nproc) V=s 2>&1 | tee build.log
           echo "=== 产物 ==="
