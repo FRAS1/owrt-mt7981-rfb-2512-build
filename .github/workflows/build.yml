@@ -51,10 +51,12 @@ jobs:
           echo "=== 源码版本 ==="
           git log -1 --format='%H%n%ad%n%s' --date=iso
           echo "=== 关键路径自检 ==="
+          # 注意: mt7981b.dtsi 由 kernel 6.12 源码树提供, 不在本仓库 dts/ 下,
+          # 因此不能在此自检 (上一轮 run 43618894018 正是栽在这一行)。
           for f in defconfig/mt7981-ax3000.config \
                    target/linux/mediatek/dts/mt7981b-cetron-ct3003.dtsi \
-                   target/linux/mediatek/dts/mt7981b.dtsi \
-                   target/linux/mediatek/image/filogic.mk; do
+                   target/linux/mediatek/image/filogic.mk \
+                   target/linux/mediatek/files-6.12/arch/arm64/boot/dts/mediatek/mt7981-rfb.dts; do
             test -f "$f" || { echo "缺少 $f, 源码结构已变化"; exit 1; }
             echo "  OK $f"
           done
@@ -396,14 +398,59 @@ jobs:
           grep -E '^CONFIG_TARGET_(mediatek|MULTI_PROFILE|DEVICE_mediatek_filogic_DEVICE_generic)' .config || true
           echo "=== MTK 闭源驱动 ==="
           grep -E '^CONFIG_PACKAGE_(kmod-mt_wifi|kmod-warp|kmod-conninfra|kmod-mediatek_hnat)=' .config || true
+          echo "=== 自定义设备是否被配置系统接受 ==="
+          grep -q '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_generic_mt7981_rfb_stock=y' .config \
+            || { echo "自定义设备未被 target metadata 收录, filogic.mk 注入失败"; exit 1; }
+          echo "  OK generic_mt7981_rfb_stock"
+          echo "=== 已启用的机型数量 (应为 1) ==="
+          grep -c '^CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_.*=y' .config
 
       - name: Build kernel / DTB only (check mode)
         if: ${{ inputs.check_only }}
         run: |
+          set -euo pipefail
           cd src
           make -j$(nproc) V=s target/linux/compile
-          echo "=== 生成的 DTB ==="
-          find build_dir -name '*generic*rf*stock*.dtb' -o -name 'mt7981b-generic-rfb-stock.dtb' | head -10
+
+          echo "=== 定位内核源码树 ==="
+          LINUX_DIR=$(find build_dir -maxdepth 3 -type d -path '*linux-mediatek_filogic/linux-*' -print -quit)
+          test -n "$LINUX_DIR" || { echo "未找到内核源码目录"; exit 1; }
+          DTC="$LINUX_DIR/scripts/dtc/dtc"
+          if [ ! -x "$DTC" ]; then
+            echo "dtc 尚未生成, 单独构建"
+            make -C "$LINUX_DIR" scripts/dtc/dtc
+          fi
+          test -x "$DTC" || { echo "dtc 不可用: $DTC"; exit 1; }
+          DTS_DIR="$LINUX_DIR/arch/arm64/boot/dts"
+          DTSI=$(find "$DTS_DIR" -name 'mt7981b.dtsi' -print -quit)
+          test -n "$DTSI" || { echo "内核源码中缺少 mt7981b.dtsi"; exit 1; }
+          echo "  LINUX_DIR=$LINUX_DIR"
+          echo "  mt7981b.dtsi=$DTSI"
+
+          echo "=== 用与 image.mk 相同的路径预处理 DTS ==="
+          cpp -nostdinc -x assembler-with-cpp \
+            -I"$DTS_DIR" -I"$DTS_DIR/include" -I"$(dirname "$DTSI")" \
+            -I"$LINUX_DIR/include" \
+            -I"$LINUX_DIR/scripts/dtc/include-prefixes" \
+            -I"$PWD/target/linux/mediatek/dts" \
+            -undef -D__DTS__ \
+            -o /tmp/rfb.pre.dts \
+            target/linux/mediatek/dts/mt7981b-generic-rfb-stock.dts
+
+          echo "=== 编译 DTB (dtc 语法/引用校验) ==="
+          "$DTC" -O dtb -o /tmp/rfb-check.dtb /tmp/rfb.pre.dts
+          ls -lh /tmp/rfb-check.dtb
+
+          echo "=== 反编译校验关键内容 ==="
+          "$DTC" -I dtb -O dts /tmp/rfb-check.dtb > /tmp/rfb-decompiled.dts
+          grep -q 'mediatek,mt7981-spim-snand-rfb' /tmp/rfb-decompiled.dts \
+            || { echo "DTB 缺少板型 compatible"; exit 1; }
+          grep -q 'label = "firmware"' /tmp/rfb-decompiled.dts \
+            || { echo "DTB 缺少 firmware 分区"; exit 1; }
+          grep -q 'label = "Factory"' /tmp/rfb-decompiled.dts \
+            || { echo "DTB 缺少 Factory 分区"; exit 1; }
+          echo "  分区节点数: $(grep -c 'partition@' /tmp/rfb-decompiled.dts)"
+          echo "=== CHECK PASSED: DTS 语法/引用/分区表均正确 ==="
 
       - name: Download sources
         if: ${{ !inputs.check_only }}
@@ -428,7 +475,7 @@ jobs:
           test -n "$IMG" && test -s "$IMG"
           SIZE=$(stat -c%s "$IMG")
           echo "镜像: $IMG ($SIZE bytes)"
-          test "$SIZE" -lt 33000000 || { echo "镜像超过 32MiB firmware 分区"; exit 1; }
+          test "$SIZE" -lt 33554432 || { echo "镜像超过 32MiB (32768k) firmware 分区"; exit 1; }
           strings "$IMG" | grep -q 'mediatek,mt7981-spim-snand-rfb' \
             && echo '板型标识 OK' \
             || echo '警告: 镜像内未找到板型标识, 需人工复核 metadata'
