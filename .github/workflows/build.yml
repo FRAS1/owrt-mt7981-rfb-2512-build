@@ -1,0 +1,461 @@
+name: Build ImmortalWrt 25.12 for MT7981 generic RFB (stock layout)
+
+# 目标设备: 192.168.2.30 / mediatek,mt7981-spim-snand-rfb / 256MB DDR3
+# 关键约束: 保持原厂分区布局与现有 BL2/FIP 不变, 只产出 sysupgrade 固件
+# 源码: chasey-dev/immortalwrt-mt798x-rebase @ 25.12 (6.12 内核 + MTK 闭源 WiFi/HNAT)
+# 分区表与设备树依据: 本机 /proc/mtd, /proc/cmdline, 运行时设备树, hanwckf 21.02 原始 DTS
+
+on:
+  workflow_dispatch:
+    inputs:
+      check_only:
+        description: '仅验证设备树与内核可编译, 不做全量编译'
+        type: boolean
+        default: false
+      lean:
+        description: '剔除大型第三方插件以缩短编译并提高成功率'
+        type: boolean
+        default: true
+      ref:
+        description: '源码分支'
+        type: string
+        default: '25.12'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 1024
+          swap-size-mb: 2048
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+
+      - name: Clone build source
+        env:
+          SRC_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 -b "$SRC_REF" https://github.com/chasey-dev/immortalwrt-mt798x-rebase.git src
+          cd src
+          echo "=== 源码版本 ==="
+          git log -1 --format='%H%n%ad%n%s' --date=iso
+          echo "=== 关键路径自检 ==="
+          for f in defconfig/mt7981-ax3000.config \
+                   target/linux/mediatek/dts/mt7981b-cetron-ct3003.dtsi \
+                   target/linux/mediatek/dts/mt7981b.dtsi \
+                   target/linux/mediatek/image/filogic.mk; do
+            test -f "$f" || { echo "缺少 $f, 源码结构已变化"; exit 1; }
+            echo "  OK $f"
+          done
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ccache clang flex bison gawk gettext git \
+            libncurses5-dev libssl-dev python3 python3-distutils \
+            rsync unzip zlib1g-dev file wget libelf-dev ecj fastjar \
+            libpython3-dev cmake ninja-build pkg-config quilt \
+            xz-utils zstd libzstd-dev swig
+          df -h /
+
+      - name: Inject custom device (DTS + image recipe + config)
+        run: |
+          set -euo pipefail
+          DTDIR=src/target/linux/mediatek/dts
+          DTS=$DTDIR/mt7981b-generic-rfb-stock.dts
+
+          cat > "$DTS" <<'DTS_EOF'
+          // SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+          //
+          // Unbranded MediaTek MT7981 RFB reference board, 256 MiB DDR3,
+          // Macronix MX35LF1GE4AB 128 MiB SPI-NAND, MT7531 4-port switch.
+          // Partition table measured from the live device (/proc/mtd, cmdline):
+          //   ubi.mtd=firmware, firmware @0x600000 size 32 MiB (dual-slot).
+          // Device-tree syntax follows the 6.12-era mt7981b-cetron-ct3003.dtsi.
+          // LED nodes are omitted: this board has none. gmac1 (external
+          // ethernet-phy-id03a2.9461) is intentionally left out for the first
+          // build so a mismatch there cannot take down the whole eth probe.
+
+          /dts-v1/;
+          #include <dt-bindings/gpio/gpio.h>
+          #include <dt-bindings/input/input.h>
+          #include <dt-bindings/interrupt-controller/irq.h>
+          #include "mt7981b.dtsi"
+
+          / {
+                  model = "MediaTek MT7981 RFB (generic stock layout)";
+                  compatible = "mediatek,mt7981-spim-snand-rfb", "mediatek,mt7981";
+
+                  aliases {
+                          serial0 = &uart0;
+                          label-mac-device = &gmac0;
+                  };
+
+                  chosen: chosen {
+                          stdout-path = "serial0:115200n8";
+                  };
+
+                  memory@40000000 {
+                          reg = <0 0x40000000 0 0x10000000>;
+                          device_type = "memory";
+                  };
+
+                  gpio-keys {
+                          compatible = "gpio-keys";
+
+                          button-reset {
+                                  label = "reset";
+                                  linux,code = <KEY_RESTART>;
+                                  gpios = <&pio 1 GPIO_ACTIVE_LOW>;
+                          };
+
+                          button-wps {
+                                  label = "wps";
+                                  linux,code = <KEY_WPS_BUTTON>;
+                                  gpios = <&pio 0 GPIO_ACTIVE_HIGH>;
+                          };
+                  };
+          };
+
+          &eth {
+                  status = "okay";
+
+                  gmac0: mac@0 {
+                          compatible = "mediatek,eth-mac";
+                          reg = <0>;
+                          phy-mode = "2500base-x";
+
+                          fixed-link {
+                                  speed = <2500>;
+                                  full-duplex;
+                                  pause;
+                          };
+                  };
+          };
+
+          &mdio_bus {
+                  switch: switch@1f {
+                          compatible = "mediatek,mt7531";
+                          reg = <31>;
+                          reset-gpios = <&pio 39 GPIO_ACTIVE_HIGH>;
+                          interrupt-controller;
+                          #interrupt-cells = <1>;
+                          interrupt-parent = <&pio>;
+                          interrupts = <38 IRQ_TYPE_LEVEL_HIGH>;
+                  };
+          };
+
+          &switch {
+                  ports {
+                          #address-cells = <1>;
+                          #size-cells = <0>;
+
+                          port@0 {
+                                  reg = <0>;
+                                  label = "lan1";
+                          };
+
+                          port@1 {
+                                  reg = <1>;
+                                  label = "lan2";
+                          };
+
+                          port@2 {
+                                  reg = <2>;
+                                  label = "lan3";
+                          };
+
+                          port@3 {
+                                  reg = <3>;
+                                  label = "lan4";
+                          };
+
+                          port@6 {
+                                  reg = <6>;
+                                  ethernet = <&gmac0>;
+                                  phy-mode = "2500base-x";
+
+                                  fixed-link {
+                                          speed = <2500>;
+                                          full-duplex;
+                                          pause;
+                                  };
+                          };
+                  };
+          };
+
+          &spi0 {
+                  pinctrl-names = "default";
+                  pinctrl-0 = <&spi0_flash_pins>;
+                  status = "okay";
+
+                  spi_nand: flash@0 {
+                          compatible = "spi-nand";
+                          reg = <0>;
+                          spi-max-frequency = <52000000>;
+                          spi-tx-bus-width = <4>;
+                          spi-rx-bus-width = <4>;
+
+                          partitions {
+                                  compatible = "fixed-partitions";
+                                  #address-cells = <1>;
+                                  #size-cells = <1>;
+
+                                  partition@0 {
+                                          label = "BL2";
+                                          reg = <0x0000000 0x0100000>;
+                                          read-only;
+                                  };
+
+                                  partition@100000 {
+                                          label = "u-boot-env";
+                                          reg = <0x0100000 0x0100000>;
+                                  };
+
+                                  partition@200000 {
+                                          label = "Factory";
+                                          reg = <0x0200000 0x0200000>;
+
+                                          nvmem-layout {
+                                                  compatible = "fixed-layout";
+                                                  #address-cells = <1>;
+                                                  #size-cells = <1>;
+
+                                                  eeprom_factory_0: eeprom@0 {
+                                                          reg = <0x0 0x1000>;
+                                                  };
+                                          };
+                                  };
+
+                                  partition@400000 {
+                                          label = "FIP";
+                                          reg = <0x0400000 0x0200000>;
+                                  };
+
+                                  partition@600000 {
+                                          label = "firmware";
+                                          reg = <0x0600000 0x2000000>;
+                                  };
+
+                                  partition@2600000 {
+                                          label = "firmware2";
+                                          reg = <0x2600000 0x2000000>;
+                                  };
+
+                                  partition@4600000 {
+                                          label = "rootfs_data";
+                                          reg = <0x4600000 0x1800000>;
+                                  };
+
+                                  partition@5e00000 {
+                                          label = "rootfs_data_backup";
+                                          reg = <0x5e00000 0x1800000>;
+                                  };
+
+                                  partition@7600000 {
+                                          label = "Factory_backup";
+                                          reg = <0x7600000 0x0200000>;
+                                          read-only;
+                                  };
+
+                                  partition@7800000 {
+                                          label = "reserved";
+                                          reg = <0x7800000 0x0800000>;
+                                          read-only;
+                                  };
+                          };
+                  };
+          };
+
+          &pio {
+                  spi0_flash_pins: spi0-pins {
+                          mux {
+                                  function = "spi";
+                                  groups = "spi0", "spi0_wp_hold";
+                          };
+
+                          conf-pu {
+                                  pins = "SPI0_CS", "SPI0_HOLD", "SPI0_WP";
+                                  drive-strength = <MTK_DRIVE_8mA>;
+                                  bias-pull-up = <MTK_PUPD_SET_R1R0_11>;
+                          };
+
+                          conf-pd {
+                                  pins = "SPI0_CLK", "SPI0_MOSI", "SPI0_MISO";
+                                  drive-strength = <MTK_DRIVE_8mA>;
+                                  bias-pull-down = <MTK_PUPD_SET_R1R0_11>;
+                          };
+                  };
+          };
+
+          &uart0 {
+                  status = "okay";
+          };
+
+          &watchdog {
+                  status = "okay";
+          };
+
+          &wifi {
+                  #address-cells = <1>;
+                  #size-cells = <0>;
+                  nvmem-cells = <&eeprom_factory_0>;
+                  nvmem-cell-names = "eeprom";
+                  status = "okay";
+
+                  band@0 {
+                          reg = <0>;
+                  };
+
+                  band@1 {
+                          reg = <1>;
+                  };
+          };
+          DTS_EOF
+
+          cat >> src/target/linux/mediatek/image/filogic.mk <<'MK_EOF'
+
+          define Device/generic_mt7981_rfb_stock
+            DEVICE_VENDOR := Generic
+            DEVICE_MODEL := MT7981 RFB (stock layout)
+            DEVICE_DTS := mt7981b-generic-rfb-stock
+            DEVICE_DTS_DIR := ../dts
+            SUPPORTED_DEVICES += mediatek,mt7981-spim-snand-rfb
+            DEVICE_PACKAGES :=
+            UBINIZE_OPTS := -E 5
+            BLOCKSIZE := 128k
+            PAGESIZE := 2048
+            IMAGE_SIZE := 32768k
+            KERNEL_IN_UBI := 1
+            IMAGES := sysupgrade.bin
+            IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+          endef
+          TARGET_DEVICES += generic_mt7981_rfb_stock
+          MK_EOF
+
+          cp src/defconfig/mt7981-ax3000.config src/.config
+          # 只构建这一个设备, 避免编译数百个机型
+          sed -i '/^CONFIG_TARGET_DEVICE_/d' src/.config
+          cat >> src/.config <<'CFG_EOF'
+          CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_generic_mt7981_rfb_stock=y
+          CONFIG_TARGET_DEVICE_PACKAGES_mediatek_filogic_DEVICE_generic_mt7981_rfb_stock=""
+          CFG_EOF
+
+          echo "=== 注入完成 ==="
+          grep -n "generic_mt7981_rfb_stock" src/target/linux/mediatek/image/filogic.mk
+          echo "分区节点数: $(grep -c 'partition@' "$DTS")"
+          echo "MTK 闭源驱动包:"
+          grep -E '^CONFIG_PACKAGE_(kmod-mt_wifi|kmod-warp|kmod-conninfra|kmod-mediatek_hnat|luci-app-mtwifi-cfg)=y' src/.config || true
+
+      - name: Slim down third-party packages
+        if: ${{ inputs.lean && !inputs.check_only }}
+        run: |
+          python3 - <<'PY'
+          p = 'src/.config'
+          drop = (
+              'CONFIG_PACKAGE_luci-app-passwall', 'CONFIG_PACKAGE_luci-app-ssr-plus',
+              'CONFIG_PACKAGE_luci-app-openclash', 'CONFIG_PACKAGE_luci-app-bypass',
+              'CONFIG_PACKAGE_luci-app-vssr', 'CONFIG_PACKAGE_luci-app-mosdns',
+              'CONFIG_PACKAGE_luci-app-smartdns', 'CONFIG_PACKAGE_luci-app-adguardhome',
+              'CONFIG_PACKAGE_luci-app-alist', 'CONFIG_PACKAGE_luci-app-rclone',
+              'CONFIG_PACKAGE_luci-app-zerotier', 'CONFIG_PACKAGE_luci-app-tailscale',
+              'CONFIG_PACKAGE_luci-app-frpc', 'CONFIG_PACKAGE_luci-app-frps',
+              'CONFIG_PACKAGE_luci-app-homeproxy', 'CONFIG_PACKAGE_luci-app-mihomo',
+              'CONFIG_PACKAGE_luci-app-ddns-go', 'CONFIG_PACKAGE_luci-app-nikki',
+              'CONFIG_PACKAGE_luci-app-dockerman', 'CONFIG_PACKAGE_docker',
+          )
+          lines = open(p).read().splitlines()
+          kept = [l for l in lines if not any(l.startswith(x) for x in drop)]
+          open(p, 'w').write('\n'.join(kept) + '\n')
+          print('剔除第三方插件配置行:', len(lines) - len(kept))
+          PY
+
+      - name: Update and install feeds
+        run: |
+          cd src
+          ./scripts/feeds update -a || ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Resolve config
+        run: |
+          cd src
+          make defconfig
+          echo "=== 目标与设备 ==="
+          grep -E '^CONFIG_TARGET_(mediatek|MULTI_PROFILE|DEVICE_mediatek_filogic_DEVICE_generic)' .config || true
+          echo "=== MTK 闭源驱动 ==="
+          grep -E '^CONFIG_PACKAGE_(kmod-mt_wifi|kmod-warp|kmod-conninfra|kmod-mediatek_hnat)=' .config || true
+
+      - name: Build kernel / DTB only (check mode)
+        if: ${{ inputs.check_only }}
+        run: |
+          cd src
+          make -j$(nproc) V=s target/linux/compile
+          echo "=== 生成的 DTB ==="
+          find build_dir -name '*generic*rf*stock*.dtb' -o -name 'mt7981b-generic-rfb-stock.dtb' | head -10
+
+      - name: Download sources
+        if: ${{ !inputs.check_only }}
+        run: |
+          cd src
+          make download -j8 V=s || make download -j1 V=s
+
+      - name: Full build
+        if: ${{ !inputs.check_only }}
+        run: |
+          cd src
+          make -j$(nproc) V=s 2>&1 | tee build.log
+          echo "=== 产物 ==="
+          ls -lh bin/targets/mediatek/filogic/ | grep -i generic || true
+
+      - name: Verify sysupgrade image
+        if: ${{ !inputs.check_only }}
+        run: |
+          set -euo pipefail
+          OUT=src/bin/targets/mediatek/filogic
+          IMG=$(find "$OUT" -maxdepth 1 -type f -name '*generic_mt7981_rfb_stock*sysupgrade*' -print -quit)
+          test -n "$IMG" && test -s "$IMG"
+          SIZE=$(stat -c%s "$IMG")
+          echo "镜像: $IMG ($SIZE bytes)"
+          test "$SIZE" -lt 33000000 || { echo "镜像超过 32MiB firmware 分区"; exit 1; }
+          strings "$IMG" | grep -q 'mediatek,mt7981-spim-snand-rfb' \
+            && echo '板型标识 OK' \
+            || echo '警告: 镜像内未找到板型标识, 需人工复核 metadata'
+          SHA=$(sha256sum "$IMG" | cut -d' ' -f1)
+          echo "$SHA  $(basename "$IMG")" > "$OUT/SHA256SUMS-custom"
+          echo "SHA256: $SHA"
+
+      - name: Upload firmware
+        if: ${{ !inputs.check_only }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: immortalwrt-25.12-mt7981-rfb-stock
+          path: |
+            src/bin/targets/mediatek/filogic/*generic_mt7981_rfb_stock*
+            src/bin/targets/mediatek/filogic/SHA256SUMS-custom
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: |
+            src/.config
+            src/target/linux/mediatek/dts/mt7981b-generic-rfb-stock.dts
+            src/build.log
+            src/bin/targets/mediatek/filogic/*generic_mt7981_rfb_stock*.dtb
+          if-no-files-found: warn
+          retention-days: 14
