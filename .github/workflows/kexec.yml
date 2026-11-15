@@ -1,0 +1,25 @@
+name: build-kexec-lite
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install aarch64 cross toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+      - name: Decode C source
+        run: echo 'I2RlZmluZSBfR05VX1NPVVJDRQojaW5jbHVkZSA8c3RkaW8uaD4KI2luY2x1ZGUgPHN0cmluZy5oPgojaW5jbHVkZSA8dW5pc3RkLmg+CiNpbmNsdWRlIDxmY250bC5oPgojaW5jbHVkZSA8c3lzL3N5c2NhbGwuaD4KI2luY2x1ZGUgPGVycm5vLmg+CgojaWZuZGVmIF9fTlJfa2V4ZWNfZmlsZV9sb2FkCiNkZWZpbmUgX19OUl9rZXhlY19maWxlX2xvYWQgMjk0CiNlbmRpZgojaWZuZGVmIF9fTlJfcmVib290CiNkZWZpbmUgX19OUl9yZWJvb3QgMTQyCiNlbmRpZgoKI2RlZmluZSBSRUJPT1RfTUFHSUMxICAgMHhmZWUxZGVhZFVMCiNkZWZpbmUgUkVCT09UX01BR0lDMiAgIDY3MjI3NDc5M1VMCiNkZWZpbmUgUkVCT09UX0NNRF9LRVhFQyAweDQ1NTg0NTQzVUwKCmludCBtYWluKGludCBhcmdjLCBjaGFyICoqYXJndikKewogICAgY29uc3QgY2hhciAqaW1nID0gYXJnYyA+IDEgPyBhcmd2WzFdIDogIi90bXAvb3dydC9JbWFnZSI7CiAgICBjb25zdCBjaGFyICpyZCAgPSBhcmdjID4gMiA/IGFyZ3ZbMl0gOiAiL3RtcC9vd3J0L2luaXRyZC54eiI7CiAgICBjb25zdCBjaGFyICpjbCAgPSBhcmdjID4gMyA/IGFyZ3ZbM10gOiAiY29uc29sZT10dHlTMCwxMTUyMDAiOwoKICAgIGludCBrID0gb3BlbihpbWcsIE9fUkRPTkxZKTsKICAgIGlmIChrIDwgMCkgeyBwZXJyb3IoIm9wZW4gSW1hZ2UiKTsgcmV0dXJuIDExOyB9CiAgICBpbnQgciA9IG9wZW4ocmQsIE9fUkRPTkxZKTsKICAgIGlmIChyIDwgMCkgeyBwZXJyb3IoIm9wZW4gaW5pdHJkIik7IHJldHVybiAxMjsgfQoKICAgIGVycm5vID0gMDsKICAgIGxvbmcgcmV0ID0gc3lzY2FsbChfX05SX2tleGVjX2ZpbGVfbG9hZCwgaywgciwKICAgICAgICAgICAgICAgICAgICAgICAodW5zaWduZWQgbG9uZykoc3RybGVuKGNsKSArIDEpLCBjbCwgMFVMKTsKICAgIGlmIChyZXQgPCAwKSB7IHBlcnJvcigia2V4ZWNfZmlsZV9sb2FkIik7IHJldHVybiAxMzsgfQoKICAgIGZwcmludGYoc3RkZXJyLCAia2V4ZWNfZmlsZV9sb2FkIE9LOyByZWJvb3RpbmcgaW50byA2LjEyIGluaXRyYW1mc1xuIik7CiAgICBzeW5jKCk7CiAgICBzeXNjYWxsKF9fTlJfcmVib290LCBSRUJPT1RfTUFHSUMxLCBSRUJPT1RfTUFHSUMyLCBSRUJPT1RfQ01EX0tFWEVDLCAwVUwpOwogICAgcGVycm9yKCJyZWJvb3QoS0VYRUMpIik7CiAgICByZXR1cm4gMTQ7Cn0K' | base64 -d > kexec-lite.c
+      - name: Compile static aarch64 binary
+        run: |
+          aarch64-linux-gnu-gcc -static -Os -s -Wall -o kexec-lite kexec-lite.c
+          file kexec-lite
+          sha256sum kexec-lite
+          test "$(stat -c %s kexec-lite)" -gt 10000
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kexec-lite
+          path: kexec-lite
+          if-no-files-found: error
