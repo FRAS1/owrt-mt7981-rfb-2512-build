@@ -1,0 +1,91 @@
+name: Build mtd6 extroot UBI image
+
+# Empty UBIFS + UBI volume for the 24MiB 'rootfs_data' MTD partition.
+# Geometry measured on live 25.12: PEB 128KiB, min I/O 2048, VID @2048, LEB 126976.
+# The single dynamic volume is named 'extroot' (NOT rootfs_data) so mount_root's
+# volume_find() still selects ubi0_2 as the legacy overlay, and fstab extroot
+# can pivot onto /dev/ubi1_0.
+# vol_flags=autoresize -> UBI grows the volume to all free PEBs on first attach;
+# mkfs.ubifs -c 256 keeps max_leb_cnt above the 192-PEB partition.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mtd-utils
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mtd-utils
+          mkfs.ubifs -V 2>&1 | head -2 || true
+          ubinize -V 2>&1 | head -2 || true
+
+      - name: Build empty extroot UBIFS
+        run: |
+          set -euo pipefail
+          rm -rf rfs
+          mkdir -p rfs/upper rfs/work
+          sudo chown -R 0:0 rfs
+          sudo mkfs.ubifs -m 2048 -e 126976 -c 256 -x none -r rfs -o extroot.ubifs
+          ls -l extroot.ubifs
+          sha256sum extroot.ubifs
+
+      - name: ubinize into mtd6 UBI image
+        run: |
+          set -euo pipefail
+          cat > ubinize.cfg <<'CFG'
+          [extroot]
+          mode=ubi
+          image=extroot.ubifs
+          vol_id=0
+          vol_name=extroot
+          vol_type=dynamic
+          vol_flags=autoresize
+          CFG
+          ubinize -m 2048 -p 128KiB -s 2048 -o mtd6-extroot.ubi.bin ubinize.cfg
+          ls -l mtd6-extroot.ubi.bin
+          sha256sum mtd6-extroot.ubi.bin | tee SHA256SUMS
+
+      - name: Verify UBI geometry
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import struct
+          b = open('mtd6-extroot.ubi.bin','rb').read()
+          PEB = 131072
+          n = len(b)//PEB
+          vols = {}
+          for p in range(n):
+              off = p*PEB
+              if b[off:off+4] != b'UBI#':
+                  continue
+              vid = b[off+2048:off+2048+64]
+              if vid[:4] != b'UBI!':
+                  continue
+              vol_id, lnum = struct.unpack('>II', vid[8:16])
+              vols[vol_id] = vols.get(vol_id, 0) + 1
+          print('image bytes:', len(b), 'PEBs:', n, 'volume LEB counts:', vols)
+          assert len(b) <= 25165824, 'image exceeds 24MiB partition'
+          assert len(b) % PEB == 0, 'image not PEB aligned'
+          assert 0 in vols, 'missing extroot volume'
+          print('EXTROOT_GEOMETRY_OK')
+          PY
+
+      - name: Upload extroot UBI image
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtd6-extroot-ubi
+          path: |
+            mtd6-extroot.ubi.bin
+            SHA256SUMS
+          if-no-files-found: error
