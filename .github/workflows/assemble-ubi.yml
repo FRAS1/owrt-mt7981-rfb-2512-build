@@ -1,0 +1,140 @@
+name: Assemble guarded 25.12 slot2 UBI image
+
+# Produces a 32MiB-slot-compatible UBI image for mtd6 (firmware2).
+# Kernel/rootfs come from the already-built sysupgrade artifact; rootfs_data is a
+# prebuilt UBIFS volume carrying the rollback guard, factory env and LAN/SSH config.
+# Geometry measured on the live device: PEB 128KiB, min I/O 2048, VID @2048, LEB 126976.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  assemble:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install mtd-utils
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mtd-utils
+          mkfs.ubifs -V 2>&1 | head -2 || true
+          ubinize -V 2>&1 | head -2 || true
+
+      - name: Download full-build artifact (internal network)
+        uses: actions/download-artifact@v4
+        with:
+          name: immortalwrt-25.12-mt7981-rfb-stock
+          run-id: '43624944179'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: art
+
+      - name: Extract kernel and root
+        run: |
+          set -euo pipefail
+          find art -maxdepth 2 -type f -printf '%p %s bytes\n' | head -20
+          SYS=$(find art -name '*squashfs-sysupgrade.bin' -type f | head -1)
+          test -n "$SYS" || { echo "sysupgrade bin missing"; exit 1; }
+          mkdir -p sys
+          tar xf "$SYS" -C sys
+          K=$(find sys -name kernel -type f | head -1)
+          R=$(find sys -name root -type f | head -1)
+          test -s "$K" && test -s "$R"
+          cp "$K" kernel
+          cp "$R" root
+          echo "kernel $(stat -c%s kernel)  root $(stat -c%s root)"
+          test "$(sha256sum kernel | cut -d' ' -f1)" = "982d95584238e572ce83fa941795a4e9ef9aeb3ebb2786bd3e29a6f987d78400"
+          test "$(sha256sum root | cut -d' ' -f1)" = "0b3812a2167bee845e7f7fe23d520c5041fbc367e4413c4ecc8a632049a18c2f"
+          sha256sum kernel root
+
+      - name: Stage rootfs_data overlay
+        run: |
+          set -euo pipefail
+          rm -rf rfs
+          mkdir -p rfs/upper/etc/config rfs/work
+          base64 -d assets/env-factory.b64 > rfs/upper/etc/owrt-env-slot1.bin
+          test "$(stat -c%s rfs/upper/etc/owrt-env-slot1.bin)" = "131072"
+          test "$(sha256sum rfs/upper/etc/owrt-env-slot1.bin | cut -d' ' -f1)" = "3b3a7378ad5997f3b03921f0d365db59e4fb186a9d79edbefe02ee0c045599fa"
+          echo 'Y29uZmlnIGludGVyZmFjZSAnbG9vcGJhY2snCglvcHRpb24gZGV2aWNlICdsbycKCW9wdGlvbiBwcm90byAnc3RhdGljJwoJb3B0aW9uIGlwYWRkciAnMTI3LjAuMC4xJwoJb3B0aW9uIG5ldG1hc2sgJzI1NS4wLjAuMCcKCmNvbmZpZyBnbG9iYWxzICdnbG9iYWxzJwoJb3B0aW9uIHVsYV9wcmVmaXggJ2ZkNDk6NTU0NjowMWQxOjovNDgnCgpjb25maWcgZGV2aWNlCglvcHRpb24gbmFtZSAnYnItbGFuJwoJb3B0aW9uIHR5cGUgJ2JyaWRnZScKCWxpc3QgcG9ydHMgJ2xhbjInCglsaXN0IHBvcnRzICdsYW4zJwoJbGlzdCBwb3J0cyAnbGFuNCcKCmNvbmZpZyBpbnRlcmZhY2UgJ2xhbicKCW9wdGlvbiBkZXZpY2UgJ2JyLWxhbicKCW9wdGlvbiBwcm90byAnc3RhdGljJwoJb3B0aW9uIG5ldG1hc2sgJzI1NS4yNTUuMjU1LjAnCglvcHRpb24gaXBhZGRyICcxOTIuMTY4LjIuMzAnCglsaXN0IGRucyAnMTkyLjE2OC4yLjknCglvcHRpb24gZ2F0ZXdheSAnMTkyLjE2OC4yLjInCg==' | base64 -d > rfs/upper/etc/config/network
+          echo 'Y29uZmlnIGRyb3BiZWFyIG1haW4KCW9wdGlvbiBlbmFibGUgJzEnCglvcHRpb24gUGFzc3dvcmRBdXRoICdvbicKCW9wdGlvbiBSb290UGFzc3dvcmRBdXRoICdvbicKCW9wdGlvbiBQb3J0ICcyMicK'  | base64 -d > rfs/upper/etc/config/dropbear
+          echo 'cm9vdDokMSRDQmRhaWdTQiQ5dTQvQ01peVpmTlpoODdGUFFJMUcwOjIwNjE4OjA6OTk5OTk6Nzo6OgpkYWVtb246KjowOjA6OTk5OTk6Nzo6OgpmdHA6KjowOjA6OTk5OTk6Nzo6OgpuZXR3b3JrOio6MDowOjk5OTk5Ojc6OjoKbm9ib2R5Oio6MDowOjk5OTk5Ojc6OjoKbnRwOng6MDowOjk5OTk5Ojc6OjoKZG5zbWFzcTp4OjA6MDo5OTk5OTo3Ojo6CmxvZ2Q6eDowOjA6OTk5OTk6Nzo6Ogp1YnVzOng6MDowOjk5OTk5Ojc6OjoK'  | base64 -d > rfs/upper/etc/shadow
+          echo 'IyEvYmluL3NoCiMgcm9sbGJhY2sgZ3VhcmQgLSBzbG90MiBJbW1vcnRhbFdydCAyNS4xMiBndWFyZGVkIGZsYXNoCnVjaSBzZXQgbmV0d29yay5sYW4uaXBhZGRyPScxOTIuMTY4LjIuMzAnIDI+L2Rldi9udWxsCnVjaSBzZXQgbmV0d29yay5sYW4ubmV0bWFzaz0nMjU1LjI1NS4yNTUuMCcgMj4vZGV2L251bGwKdWNpIGNvbW1pdCBuZXR3b3JrIDI+L2Rldi9udWxsCmZvciBwIGluICQobHMgL3N5cy9jbGFzcy9uZXQgMj4vZGV2L251bGwgfCBncmVwIC1FICdeKGxhbnxldGgpJyk7IGRvIGlwIGxpbmsgc2V0ICIkcCIgdXAgMj4vZGV2L251bGw7IGRvbmUKaXAgbGluayBzZXQgYnItbGFuIHVwIDI+L2Rldi9udWxsCmlwIGFkZHIgcmVwbGFjZSAxOTIuMTY4LjIuMzAvMjQgZGV2IGJyLWxhbiAyPi9kZXYvbnVsbCB8fCBpcCBhZGRyIHJlcGxhY2UgMTkyLjE2OC4yLjMwLzI0IGRldiBsYW4xIDI+L2Rldi9udWxsIHx8IGlwIGFkZHIgcmVwbGFjZSAxOTIuMTY4LjIuMzAvMjQgZGV2IGV0aDAgMj4vZGV2L251bGwKL2V0Yy9pbml0LmQvZHJvcGJlYXIgcmVzdGFydCA+L2Rldi9udWxsIDI+JjEKKAogIGxvZ2dlciAtdCByb2xsYmFjay1ndWFyZCAiYXJtZWQ6IDMwMHMgY291bnRkb3duIgogIHNsZWVwIDMwMAogIGlmIFsgISAtZiAvZXRjL293cnQtY29uZmlybWVkIF07IHRoZW4KICAgIGxvZ2dlciAtdCByb2xsYmFjay1ndWFyZCAiTk9UIGNvbmZpcm1lZCAtPiBmYWN0b3J5IGVudiArIHJlYm9vdCIKICAgIG10ZCAtcSB3cml0ZSAvZXRjL293cnQtZW52LXNsb3QxLmJpbiB1LWJvb3QtZW52CiAgICBzeW5jCiAgICByZWJvb3QgLWYKICBlbHNlCiAgICBsb2dnZXIgLXQgcm9sbGJhY2stZ3VhcmQgImNvbmZpcm1lZDogc3RheWluZyBvbiBzbG90MiAyNS4xMiIKICBmaQopID4vZGV2L251bGwgMj4mMSAmCmV4aXQgMAo='  | base64 -d > rfs/upper/etc/rc.local
+          chmod 0755 rfs/upper/etc/rc.local
+          chmod 0600 rfs/upper/etc/shadow
+          sudo chown -R 0:0 rfs
+          find rfs -printf '%M %u:%g %p\n' | head -30
+          echo "--- rc.local ---"
+          cat rfs/upper/etc/rc.local
+
+      - name: Build UBIFS image
+        run: |
+          set -euo pipefail
+          sudo mkfs.ubifs -m 2048 -e 126976 -c 256 -x none -r rfs -o rootfs_data.ubifs
+          ls -l rootfs_data.ubifs
+          sha256sum rootfs_data.ubifs
+
+      - name: ubinize into slot2 UBI image
+        run: |
+          set -euo pipefail
+          cat > ubinize.cfg <<'CFG'
+          [kernel]
+          mode=ubi
+          image=kernel
+          vol_id=0
+          vol_name=kernel
+          vol_type=static
+          [rootfs]
+          mode=ubi
+          image=root
+          vol_id=1
+          vol_name=rootfs
+          vol_type=static
+          [rootfs_data]
+          mode=ubi
+          image=rootfs_data.ubifs
+          vol_id=2
+          vol_name=rootfs_data
+          vol_type=dynamic
+          vol_flags=autoresize
+          CFG
+          ubinize -m 2048 -p 128KiB -s 2048 -o slot2-25.12.ubi.bin ubinize.cfg
+          ls -l slot2-25.12.ubi.bin
+          sha256sum slot2-25.12.ubi.bin | tee SHA256SUMS
+
+      - name: Verify UBI volume table geometry
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import struct
+          b = open('slot2-25.12.ubi.bin','rb').read()
+          PEB = 131072
+          n = len(b)//PEB
+          vols = {}
+          for p in range(n):
+              off = p*PEB
+              vid = b[off+2048:off+2048+64]
+              if vid[:4] != b'UBI!':
+                  continue
+              vol_id, lnum = struct.unpack('>II', vid[8:16])
+              vols[vol_id] = vols.get(vol_id, 0) + 1
+          print('image bytes:', len(b), 'PEBs:', n, 'volume LEB counts:', vols)
+          assert len(b) <= 33554432, 'image exceeds 32MiB slot'
+          assert 0 in vols and 1 in vols and 2 in vols, 'missing kernel/rootfs/rootfs_data volume'
+          assert vols[0] >= 36 and vols[1] >= 92, 'static volumes too small'
+          print('UBI_GEOMETRY_OK')
+          PY
+
+      - name: Upload guarded UBI image
+        uses: actions/upload-artifact@v4
+        with:
+          name: slot2-25.12-guarded-ubi
+          path: |
+            slot2-25.12.ubi.bin
+            SHA256SUMS
+          if-no-files-found: error
